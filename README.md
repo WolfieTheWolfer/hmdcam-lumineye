@@ -1,3 +1,23 @@
+This branch incorporates changes that allow sending eyetracking data over USB to Lumineye, an ESP32S3 based LCD eye and central control system for fursuits.
+This isn't necessary for getting Lumineye working and is an expensive, laborious feature that adds QoL for LCD eye users and more features.
+Link to the Lumineye project: [link](https://github.com/WolfieTheWolfer/Lumineye)
+
+A lot of the changes in here are made for my setup, which is not as fancy as Fraxul's, but is more accessible for those who are interested in the project.
+
+My reference test/development platform:
+- Jetson Orin Nano 8GB Developer Kit running L4T r36.5.0 / JetPack 6.2.2
+  - If you're also using a Nano and plan on using eye/facetracking, the engines need to be recompiled to use GPU processing due to the Nano lacking DLA.
+- 2x [Yahboom IMX219](https://www.amazon.com/dp/B0C5844MWQ) sensors: 2 lane, 720p, 60fps.
+  - There has been no modification to the cameras beyond covering the FPC in electrical tape.
+  - These are the main FPV cameras.
+- 2x [Arducam OV9281](https://www.amazon.com/dp/B096M5DKY6) sensors: USB, 720p, 100fps
+  - These are used for the eye trackers.
+  - I recommend using IR LEDs in conjunction to illuminate your eyes for the camera.
+- Samsung Odyssey+ (2019) HMD: 2880x1440 at 90hz.
+- Depth processing using the Orin's OFA hardware.
+
+# Original Description:
+
 # hmdcam: An indirect vision system for fursuit pilots
 
 
