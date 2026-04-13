@@ -1,6 +1,7 @@
 #include "VectorOps.h"
 #include <assert.h>
 #include <algorithm>
+#include <arm_acle.h>
 
 // Fast conversion of 0....255 range uint8 values to -1...1 range fp16 values
 // Has a tiny precision loss around input 127 / output zero:
@@ -75,24 +76,33 @@ void convertUnorm8ToDLAInt8(const uint8_t* inU8, void* outDLAInt8, size_t elemen
   }
 }
 
+// Threshold operation on fp16 values array
+// Output uint8_t elements are 0 if input is < thresholdValue, 0xff if input is >= thresholdValue
+// elementCount must be a multiple of 16.
 void fp16ThresholdToU8Mask(const _Float16* inFP16, _Float16 thresholdValue, uint8_t* outU8, size_t elementCount) {
-  // Only support chunks of 8 elements right now
-  assert((elementCount & 7) == 0);
+  // Only support chunks of 16 elements right now
+  assert((elementCount & 15) == 0);
 
-  uint8x8_t* vectorOut = reinterpret_cast<uint8x8_t*>(outU8);
+  uint8x16_t* vectorOut = reinterpret_cast<uint8x16_t*>(outU8);
   const float16x8_t refval = vdupq_n_f16(thresholdValue);
 
-  for (size_t chunkIdx = 0; chunkIdx < (elementCount / 8); ++chunkIdx) {
-    // Load 8x fp16 values
-    float16x8_t x = vld1q_f16(reinterpret_cast<const __fp16*>(inFP16 + (chunkIdx * 8)));
+  for (size_t chunkIdx = 0; chunkIdx < (elementCount / 16); ++chunkIdx) {
+    size_t baseIdx = chunkIdx * 16;
+
+    // Load 16x fp16 values
+    float16x8_t x0 = vld1q_f16(reinterpret_cast<const __fp16*>(inFP16 + baseIdx));
+    float16x8_t x1 = vld1q_f16(reinterpret_cast<const __fp16*>(inFP16 + baseIdx + 8));
 
     // Compare to ref value. result is 16-bit 0000 (false) or ffff (true)
-    uint16x8_t c16 = vcgeq_f16(x, refval);
+    uint16x8_t c16_0 = vcgeq_f16(x0, refval);
+    uint16x8_t c16_1 = vcgeq_f16(x1, refval);
 
-    // Shift right and narrow to 8 bits
-    uint8x8_t c8 = vshrn_n_u16(c16, 8);
+    // Narrow to 8-bit masks
+    uint8x8_t c8_0 = vmovn_u16(c16_0);
+    uint8x8_t c8_1 = vmovn_u16(c16_1);
 
-    // TODO: May be able to compare two blocks of values, then reinterpret to u8 and use vuzp1_u8 to zip bytes of the compare results together for 16 elements at a time
+    // Interleave the two 8-byte results into a single 16-byte result
+    uint8x16_t c8 = vcombine_u8(c8_0, c8_1);
 
     // Write output
     vectorOut[chunkIdx] = c8;
@@ -132,5 +142,103 @@ _Float16 fp16VectorMax(const _Float16* inFP16, size_t elementCount) {
   }
 
   return result;
+}
+
+// Convert single-channel u8 input to rgba8 output, with alpha = 0xff
+void convertGrayToRGBA(const uint8_t* inGray, uint8_t* outRGBA, size_t count) {
+  // Broadcast 0xff into all 16 lanes of a 128-bit vector — this is our alpha channel
+  const uint8x16_t alpha = vdupq_n_u8(0xff);
+  size_t vectorCount = count & ~size_t(15);
+  for (size_t i = 0; i < vectorCount; i += 16) {
+    // Load 16 contiguous gray values into a 128-bit NEON register
+    uint8x16_t g = vld1q_u8(inGray + i);
+
+    // Pack the R, G, B, A channels as a struct-of-vectors:
+    //   .val[0] = R = g   (gray copied to red)
+    //   .val[1] = G = g   (gray copied to green)
+    //   .val[2] = B = g   (gray copied to blue)
+    //   .val[3] = A = 0xff
+    uint8x16x4_t rgba = {{g, g, g, alpha}};
+
+    // Store with 4-lane interleave: takes the struct-of-vectors layout above
+    // and writes 64 bytes in array-of-structs (R,G,B,A,R,G,B,A,...) order.
+    // The hardware handles the de-interleave, so we get 16 RGBA pixels in one store.
+    vst4q_u8(outRGBA + i * 4, rgba);
+  }
+  // Scalar fallback for any trailing pixels beyond the last full 16-element vector
+  for (size_t i = vectorCount; i < count; ++i) {
+    uint8_t c = inGray[i];
+    outRGBA[i * 4 + 0] = c;
+    outRGBA[i * 4 + 1] = c;
+    outRGBA[i * 4 + 2] = c;
+    outRGBA[i * 4 + 3] = 0xff;
+  }
+}
+
+// 6x6 area downsample of an input image using a box filter:
+// Output image dimensions is (inputWidth/6, inputHeight/6)
+// Each output pixel is the average of the corresponding 6x6 pixel area in the input image.
+void areaDownsample6x6(const uint8_t* __restrict inU8, size_t inputRowStride, uint8_t* __restrict outU8, size_t outputWidth, size_t outputHeight, size_t outputRowStride) {
+  // Output line-width is guaranteed to be a multiple of 8 pixels wide.
+  assert((outputWidth & 7) == 0);
+
+  // Division by 36 via vqrdmulh: sat_s16((2*a*910 + 2^15) >> 16) ~= round(a/36)
+  const int16x8_t kDiv36 = vdupq_n_s16(910);
+
+  // Row-streaming approach: process one input row at a time left-to-right across the full
+  // output width. This gives the HW prefetcher a single sequential DRAM stream (optimal for
+  // bandwidth), with partial sums kept in a tiny L1-resident buffer.
+  // The output width is generally small, so we just keep it on the stack.
+  alignas(16) uint16_t partialBuf[outputWidth];
+
+#define preload(x) __pldx(0, 0, 1, x)
+  for (size_t outputY = 0; outputY < outputHeight; ++outputY) {
+    uint8_t* outputRow = outU8 + (outputY * outputRowStride);
+    const uint8_t* baseRow = inU8 + ((outputY * 6) * inputRowStride);
+
+    // Row 0: initialize partial sums
+    {
+      const uint8_t* row = baseRow;
+      preload(row); preload(row + 64); preload(row + 128);
+      for (size_t outputX = 0, off = 0; outputX < outputWidth; outputX += 8, off += 48) {
+        uint8x16x3_t x = vld3q_u8(row + off);
+        uint16x8_t s = vpaddlq_u8(x.val[0]);
+        s = vpadalq_u8(s, x.val[1]);
+        s = vpadalq_u8(s, x.val[2]);
+        vst1q_u16(partialBuf + outputX, s);
+      }
+    }
+
+    // Rows 1-4: accumulate into partial sums (one row at a time for single-stream DRAM access)
+    for (size_t rowIdx = 1; rowIdx < 5; ++rowIdx) {
+      const uint8_t* row = baseRow + rowIdx * inputRowStride;
+      preload(row); preload(row + 64); preload(row + 128);
+      for (size_t outputX = 0, off = 0; outputX < outputWidth; outputX += 8, off += 48) {
+        uint16x8_t s = vld1q_u16(partialBuf + outputX);
+        uint8x16x3_t x = vld3q_u8(row + off);
+        s = vpadalq_u8(s, x.val[0]);
+        s = vpadalq_u8(s, x.val[1]);
+        s = vpadalq_u8(s, x.val[2]);
+        vst1q_u16(partialBuf + outputX, s);
+      }
+    }
+
+    // Row 5 + divide: merge last accumulation with division
+    {
+      const uint8_t* row = baseRow + 5 * inputRowStride;
+      preload(row); preload(row + 64); preload(row + 128);
+      for (size_t outputX = 0, off = 0; outputX < outputWidth; outputX += 8, off += 48) {
+        uint16x8_t s = vld1q_u16(partialBuf + outputX);
+        uint8x16x3_t x = vld3q_u8(row + off);
+        s = vpadalq_u8(s, x.val[0]);
+        s = vpadalq_u8(s, x.val[1]);
+        s = vpadalq_u8(s, x.val[2]);
+        int16x8_t div = vqrdmulhq_s16(vreinterpretq_s16_u16(s), kDiv36);
+        uint8x8_t res = vqmovun_s16(div);
+        vst1_u8(outputRow + outputX, res);
+      }
+    }
+  }
+#undef preload
 }
 

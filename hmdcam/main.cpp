@@ -72,6 +72,8 @@ bool debugShowDepthMap = true;
 float uiScale = 0.2f;
 float uiDepth = 0.4f;
 
+bool drawStatusBar = true;
+
 
 uint64_t settingsDirtyFrame = 0; // 0 if not dirty, frame number otherwise.
 const int kSettingsAutosaveIntervalSeconds = 10;
@@ -166,6 +168,12 @@ static void signal_handler(int) {
   signal(SIGINT,  SIG_DFL);
   signal(SIGTERM, SIG_DFL);
   signal(SIGQUIT, SIG_DFL);
+}
+
+int restartSkipFrameCounter = 0;
+void debugRestartCapture() {
+  argusCamera->stop(); // will automatically restart on next frame when we call setRepeatCapture again
+  restartSkipFrameCounter = 3; // skip a few frames before restarting to smooth out the timing glitch we just caused
 }
 
 
@@ -589,7 +597,6 @@ int main(int argc, char* argv[]) {
     bool debugEnableFastDebugToggles = false;
     bool fastDebugEnableStateDidChange = false; // true for 1 frame when debugEnableFastDebugToggles is changed in the UI
     bool debugEnableDepthMapGenerator = true;
-    int restartSkipFrameCounter = 0;
     boost::scoped_ptr<CameraSystem::CalibrationContext> calibrationContext;
     boost::scoped_ptr<IDebugOverlay> debugOverlay;
 
@@ -1094,8 +1101,7 @@ int main(int argc, char* argv[]) {
 
           // TODO: Check if capture restart still breaks depth on other backends
           if (ImGui::Button((depthBackend == kDepthBackendOFA) ? "Restart Capture" : "Restart Capture (BREAKS DEPTH!)")) {
-            argusCamera->stop(); // will automatically restart on next frame when we call setRepeatCapture again
-            restartSkipFrameCounter = 3; // skip a few frames before restarting to smooth out the timing glitch we just caused
+            debugRestartCapture();
           }
 
           if (depthMapGenerator) {
@@ -1190,7 +1196,7 @@ int main(int argc, char* argv[]) {
           saveSettings();
         }
 
-      } else {
+      } else if (drawStatusBar) {
         nvtxMarkA("ImGUI (statusbar)");
         ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x*0.5f, 0), 0, /*pivot=*/ImVec2(0.5f, 0.0f)); // top-center aligned
         ImGui::SetNextWindowSize(ImVec2(0, 0), ImGuiCond_Always); // always auto-size to contents
