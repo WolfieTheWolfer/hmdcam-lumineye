@@ -35,6 +35,7 @@ tegraEnv.Append(
     'boost_chrono', 'boost_system', 'boost_thread',
     'epoxy',
     'drm',
+    'gbm',
     'wayland-client', 'wayland-egl', 'xkbcommon',
     'hidapi-libusb', 'usb-1.0', 'udev',
     'cuda', 'cudart',
@@ -73,6 +74,7 @@ if tegraEnv['IS_TEGRA']:
       '#tegra_mmapi',
       '#nvsci_headers',
       '#nvmedia',
+      '/usr/include/aarch64-linux-gnu',
     ],
     LIBS=[
       'nvargus',
@@ -80,6 +82,7 @@ if tegraEnv['IS_TEGRA']:
       'nvmedia_iofa_sci', 'nvmedia_ijpd_sci',
       'nvscibuf', 'nvscicommon', 'nvscievent', 'nvsciipc', 'nvscisync',
       'cudla',
+      'nvinfer',
       'v4l2'
     ] + tegraEnv['CERES_LIBS'],
     CPPDEFINES=[

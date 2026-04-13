@@ -13,6 +13,7 @@
 #include <EGLStream/EGLStream.h>
 #include <cudaEGL.h>
 #include <opencv2/cvconfig.h>
+#include <unistd.h>
 
 #ifdef USE_NVBUF_UTILS
 #include <nvbuf_utils.h>
@@ -225,6 +226,8 @@ void ArgusCamera::buildCaptureSessions() {
 
     // Create the capture session
     Argus::CaptureSession* session = iCameraProvider->createCaptureSession(sessionDevices);
+    // Allow ISP time to initialize after session creation
+    usleep(500000); // 500ms
     sessionData.m_captureSession = session;
 
     Argus::ICaptureSession *iCaptureSession = Argus::interface_cast<Argus::ICaptureSession>(session);
@@ -761,6 +764,7 @@ bool ArgusCamera::readFrame() {
       printf("ArgusCamera::readFrame(): Capture failed (%u/%u), attempting to recover\n", m_failedCaptures, kFailedCaptureThreshold);
       // Issue all stop-repeat requests and wait for the sessions to become idle
       for (size_t sessionIdx = 0; sessionIdx < sessionCount(); ++sessionIdx) {
+        if (m_perSessionData[sessionIdx].m_sessionCaptureFailed) continue;
         Argus::ICaptureSession *iCaptureSession = Argus::interface_cast<Argus::ICaptureSession>(m_perSessionData[sessionIdx].m_captureSession);
         Argus::Status status = iCaptureSession->cancelRequests();
         printf("ArgusCamera::readFrame(): cancelRequests(session %zu): %s\n", sessionIdx, argusStatusStr(status));
@@ -768,24 +772,19 @@ bool ArgusCamera::readFrame() {
 
 
       // Give the sessions time to return to idle
-      bool waitForIdleOK;
+      bool waitForIdleOK = true;
 
-      for (size_t waitForIdleAttempt = 0; waitForIdleAttempt < kFailedWaitForIdleThreshold; ++waitForIdleAttempt) {
-        waitForIdleOK = true;
-        for (size_t sessionIdx = 0; sessionIdx < sessionCount(); ++sessionIdx) {
-          Argus::ICaptureSession *iCaptureSession = Argus::interface_cast<Argus::ICaptureSession>(m_perSessionData[sessionIdx].m_captureSession);
-          Argus::Status status = iCaptureSession->waitForIdle(kWaitForIdleTimeoutNs);
-          printf("ArgusCamera::readFrame(): waitForIdle(session %zu): %s\n", sessionIdx, argusStatusStr(status));
-          if (status != Argus::STATUS_OK)
-            waitForIdleOK = false;
-        }
-
-        if (waitForIdleOK)
-          break;
+      for (size_t sessionIdx = 0; sessionIdx < sessionCount(); ++sessionIdx) {
+        if (m_perSessionData[sessionIdx].m_sessionCaptureFailed) continue;
+        Argus::ICaptureSession *iCaptureSession = Argus::interface_cast<Argus::ICaptureSession>(m_perSessionData[sessionIdx].m_captureSession);
+        Argus::Status status = iCaptureSession->waitForIdle(kWaitForIdleTimeoutNs);
+        printf("ArgusCamera::readFrame(): waitForIdle(session %zu): %s\n", sessionIdx, argusStatusStr(status));
+        if (status != Argus::STATUS_OK)
+          waitForIdleOK = false;
       }
 
       if (!waitForIdleOK) {
-        die("ArgusCamera::readFrame(): Couldn't recover from capture session failure -- terminating the process");
+        printf("ArgusCamera::readFrame(): waitForIdle failed on some sessions, continuing anyway\n");
       }
 
       teardownCaptureSessions();

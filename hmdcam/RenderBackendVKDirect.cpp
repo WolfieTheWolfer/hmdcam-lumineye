@@ -31,6 +31,7 @@ const std::vector<const char*> requiredInstanceExtensions = {
   VK_KHR_DISPLAY_EXTENSION_NAME,
   VK_KHR_EXTERNAL_MEMORY_CAPABILITIES_EXTENSION_NAME,
   VK_KHR_EXTERNAL_SEMAPHORE_CAPABILITIES_EXTENSION_NAME,
+  VK_EXT_ACQUIRE_DRM_DISPLAY_EXTENSION_NAME,
 };
 
 const std::vector<const char*> requiredDeviceExtensions = {
@@ -101,6 +102,19 @@ void RenderBackendVKDirect::init() {
 
     m_display.m_displayProperties = displays[0];
     m_display.m_displayKHR = m_display.m_displayProperties.display;
+
+    // Acquire the display exclusively - required on Tegra before swapchain creation
+    {
+      int drmFd = open("/dev/dri/card0", O_RDWR);
+      CHECK(drmFd >= 0);
+      int masterRet = drmSetMaster(drmFd);
+      printf("drmSetMaster result: %d\n", masterRet);
+      auto acquireFunc = (PFN_vkAcquireDrmDisplayEXT)vkGetInstanceProcAddr(m_instance.get(), "vkAcquireDrmDisplayEXT");
+      CHECK(acquireFunc);
+      VkResult result = acquireFunc(m_gpu, drmFd, m_display.m_displayKHR);
+      printf("vkAcquireDrmDisplayEXT result: %d\n", result);
+      close(drmFd);
+    }
   }
 
   // Physical device properties enumeration
@@ -278,15 +292,22 @@ void RenderBackendVKDirect::init() {
 
     // Select a suitable presentation mode. eFifo is required to be supported so that'll be our fallback.
     vk::PresentModeKHR presentMode = vk::PresentModeKHR::eFifo;
-    if (contains(presentModes, vk::PresentModeKHR::eMailbox)) { // Mailbox: optimal
-      presentMode = vk::PresentModeKHR::eMailbox;
-    } else if (contains(presentModes, vk::PresentModeKHR::eImmediate)) { // Immediate might tear, but it'll keep latency low
-      presentMode = vk::PresentModeKHR::eImmediate;
-    }
+    // Force Fifo on Tegra - Immediate/Mailbox cause ErrorUnknown on createSwapchainKHR
+    //if (contains(presentModes, vk::PresentModeKHR::eMailbox)) { // Mailbox: optimal
+    //  presentMode = vk::PresentModeKHR::eMailbox;
+    //} else if (contains(presentModes, vk::PresentModeKHR::eImmediate)) { // Immediate might tear, but it'll keep latency low
+    //  presentMode = vk::PresentModeKHR::eImmediate;
+    //}
 
     printf("\nSelected presentation mode: %s\n", to_string(presentMode).c_str());
 
     // VK_KHR_display
+
+    printf("imageCount: %u (min=%u max=%u)\n", imageCount, capabilities.minImageCount, capabilities.maxImageCount);
+    printf("extent: %ux%u\n", extent.width, extent.height);
+    printf("supportedUsageFlags: %s\n", to_string(capabilities.supportedUsageFlags).c_str());
+    printf("supportedCompositeAlpha: %s\n", to_string(capabilities.supportedCompositeAlpha).c_str());
+    printf("format: %s %s\n", to_string(format.format).c_str(), to_string(format.colorSpace).c_str());
     // create swapchain using the ddisplay surface created before
 
     vk::SwapchainCreateInfoKHR swapchainCreateInfo{vk::SwapchainCreateFlagsKHR(),

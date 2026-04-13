@@ -58,6 +58,8 @@
 #include "stb/stb_image.h"
 #include "stb/stb_image_write.h"
 
+#include "GazeSender.h"
+
 // Camera render parameters
 float zoomFactor = 1.0f;
 float stereoOffset = 0.0f;
@@ -374,7 +376,8 @@ int main(int argc, char* argv[]) {
     gloveController = new GloveController();
   }
 
-
+  GazeSender* gazeSender = new GazeSender();
+  gazeSender->open("/dev/ttyACM0"); // or wherever the ESP32 shows up
   // Open the cameras
 
 #if IS_TEGRA
@@ -455,10 +458,13 @@ int main(int argc, char* argv[]) {
 
   if (cameraSystem->views() == 0) {
     printf("No calibration data, creating a stub\n");
-    if (cameraSystem->cameras() == 1) {
-      cameraSystem->createMonoView(0);
+    size_t workingCameras = argusCamera->streamCount();
+    if (workingCameras >= 2) {
+      cameraSystem->createStereoView(1, 0);
+      printf("Created stereo view (cameras 0+1)\n");
     } else {
-      cameraSystem->createStereoView(0, 1);
+      cameraSystem->createMonoView(0);
+      printf("Created mono view (camera 0 only)\n");
     }
     cameraSystem->saveCalibrationData();
   }
@@ -750,9 +756,12 @@ int main(int argc, char* argv[]) {
     }
 
     // Start repeating capture
-    if (!debugNoRepeatingCapture)
+    if (!debugNoRepeatingCapture) {
       argusCamera->setRepeatCapture(true);
-
+      printf("Waiting for ISP to stabilize...\n");
+      usleep(1000000); // 1 second - allow ISP mode switch to complete
+      printf("ISP stabilization complete\n");
+    }
 
     // Perf queries
     RHITimerQuery::ptr viewRenderQuery = rhi()->newTimerQuery();
@@ -868,8 +877,17 @@ int main(int argc, char* argv[]) {
             }
           }
         }
-      }
 
+        // Send gaze data to ESP32 — runs every frame
+        auto& ps1 = eyeTrackingService->m_processingState[1];
+        if (ps1.m_eyeFitterOutputsValid) {
+          glm::vec3 gazeR = ps1.fitPupilNormal();
+          GazeVec3 rightGazeVec = {gazeR.x, gazeR.y, gazeR.z};
+          GazeVec3 leftGazeVec  = {-gazeR.x * 0.9f, gazeR.y, gazeR.z};
+          float pupilMm = (float)ps1.m_fitPupilCircle.radius * 2.0f;
+          gazeSender->send(leftGazeVec, pupilMm, 1.0f, rightGazeVec, pupilMm, 1.0f);
+        }
+      }
       if (faceTrackingService && faceTrackingService->processFrame()) {
         if (debugPrintLatency && ((frameCounter & 127) == 0)) {
           if (faceTrackingService->m_processingState.processingThreadAlive()) {
@@ -948,6 +966,7 @@ int main(int argc, char* argv[]) {
 
               if (ImGui::Button(caption)) {
                 calibrationContext.reset(cameraSystem->calibrationContextForCamera(cameraIdx));
+                restartSkipFrameCounter = 3;
               }
             }
             for (size_t viewIdx = 0; viewIdx < cameraSystem->views(); ++viewIdx) {
@@ -959,6 +978,7 @@ int main(int argc, char* argv[]) {
                 sprintf(caption, "Calibrate stereo view %zu", viewIdx);
                 if (ImGui::Button(caption)) {
                   calibrationContext.reset(cameraSystem->calibrationContextForView(viewIdx));
+                  restartSkipFrameCounter = 3;
                 }
                 sprintf(caption, "View %zu is Panorama", viewIdx);
                 ImGui::Checkbox(caption, &v.isPanorama);
@@ -970,6 +990,7 @@ int main(int argc, char* argv[]) {
                 sprintf(caption, "Calibrate offset for stereo view %zu", viewIdx);
                 if (ImGui::Button(caption)) {
                   calibrationContext.reset(cameraSystem->calibrationContextForStereoViewOffset(0, viewIdx));
+                  restartSkipFrameCounter = 3;
                 }
               }
               {

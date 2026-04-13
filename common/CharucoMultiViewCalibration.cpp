@@ -191,9 +191,6 @@ bool CharucoMultiViewCalibration::processFrame(bool captureRequested) {
     FxThreading::runArrayTask(0, cameraCount(), [&](size_t cameraIdx) {
       memset(m_feedbackView[cameraIdx].ptr(0), 0, m_feedbackView[cameraIdx].total() * 4);
 
-      if (!currentCharucoCornerIds[cameraIdx].empty()) {
-        internal_drawDetectedMarkers(m_feedbackView[cameraIdx], currentCharucoCornerIds[cameraIdx]);
-      }
 
       // Borrowed from cv::aruco::drawDetectedCornersCharuco -- modified to switch the color per-marker to indicate stereo visibility
       for(size_t cornerIdx = 0; cornerIdx < currentCharucoCornerIds[cameraIdx].size(); ++cornerIdx) {

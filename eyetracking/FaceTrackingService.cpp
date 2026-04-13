@@ -48,10 +48,7 @@ FaceTrackingService::~FaceTrackingService() {
 
 void FaceTrackingService::ProcessingState::loadTrackingEngine() {
   // Load engine
-  {
-    mmfile fp("eyetracking/models/facetracking-dla-standalone.engine");
-    m_trackingModel.reset(new CuDLAStandaloneRunner(0, reinterpret_cast<const uint8_t*>(fp.data()), fp.size()));
-  }
+  m_trackingModel.reset(new InferenceRunner("eyetracking/models/facetracking-gpu.engine"));
 
   // Get the input size
   {

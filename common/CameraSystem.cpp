@@ -1041,7 +1041,9 @@ void CameraSystem::StereoCalibrationContext::renderStatusUI() {
       }
 
       m_calibState->dropSampleAtIndex(maxErrorRow);
-      internalUpdateCaptureState();
+      if (m_calibState->m_objectPoints.size() >= 3) {
+        internalUpdateCaptureState();
+      }
     }
   }
   ImGui::Checkbox("Allow camera intrinsic modification", &m_allowIntrinsicModification);
@@ -1053,7 +1055,9 @@ void CameraSystem::StereoCalibrationContext::processFrameCaptureMode() {
     // capture request succeeded if return is true
     acknowledgeCaptureRequest();
 
-    internalUpdateCaptureState();
+    if (m_calibState->m_objectPoints.size() >= 3) {
+        internalUpdateCaptureState();
+    }
 
     // TODO serialize/save calibration data
 
