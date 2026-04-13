@@ -10,6 +10,8 @@
 #include <glm/glm.hpp>
 #include <opencv2/core.hpp>
 #include "CuDLAStandaloneRunner.h"
+#include "TRTGPURunner.h"
+using InferenceRunner = TRTGPURunner;
 
 #include <algorithm>
 #include <memory>
@@ -72,6 +74,9 @@ public:
   class ProcessingState : public TrackingThreadBase {
   public:
     virtual ~ProcessingState();
+
+    float m_eyeOpenness = 1.0f;         // 0=closed, 1=open
+    float m_eyeOpenRadiusRef = 0.0f;    // calibrated open-eye pupil radius
 
     EyeTrackingService* m_service = nullptr; // Ref to containing service
     size_t m_eyeIdx = 0; // Which eye this is, for debug prints
@@ -162,8 +167,8 @@ public:
     singleeyefitter::EyeModelFitter m_eyeModelFitter;
 
     // Execution context for running the tracking model
-    std::unique_ptr<CuDLAStandaloneRunner> m_segmentationExec;
-    std::unique_ptr<CuDLAStandaloneRunner> m_roiExec;
+    std::unique_ptr<InferenceRunner> m_segmentationExec;
+    std::unique_ptr<InferenceRunner> m_roiExec;
 
     // Debug view support
     cv::Mat m_debugViewRGB; // RGB debug view, optionally with debug overlays drawn on it
@@ -187,6 +192,9 @@ public:
   // per-eye state
   ProcessingState m_processingState[2];
 
+  // true if DLA hardware unavailable at startup; all methods become no-ops
+  bool m_disabled = false;
+  
 protected:
 
   void CANTransmitEyeAngles(); // called in processFrame()

@@ -86,112 +86,99 @@ template <typename T> glm::vec2 boundsCenterFromPoints(const std::vector<cv::Poi
 }
 
 EyeTrackingService::EyeTrackingService() {
-
-  // Set some ProcessingState constants
+  // Set some ProcessingState constants — no DLA involved, always safe
   PER_EYE {
     m_processingState[eyeIdx].m_eyeIdx = eyeIdx;
     m_processingState[eyeIdx].m_service = this;
     m_processingState[eyeIdx].m_captureDirName = "eyetracking-captures";
-
-    // Construct capture file suffix with eye index
     m_processingState[eyeIdx].m_captureFileSuffix = (eyeIdx  ? "_right" : "_left");
   }
-
-  loadCalibrationData();
-
-  // Load segmentation engine
-  {
-    mmfile fp("eyetracking/models/eyeseg-dla-standalone.engine");
+ 
+  // Everything from here touches DLA hardware. If cudlaCreateDevice fails
+  // (status 7 = device unavailable) we catch the exception, set m_disabled,
+  // and let hmdcam continue without eye tracking. The ESP32 displays will
+  // receive default center-gaze packets from GazeSender.
+  try {
+    loadCalibrationData();
+ 
+    // Load segmentation and ROI engines (GPU TensorRT)
     PER_EYE {
-      m_processingState[eyeIdx].m_segmentationExec.reset(new CuDLAStandaloneRunner(0, reinterpret_cast<const uint8_t*>(fp.data()), fp.size()));
+      m_processingState[eyeIdx].m_segmentationExec.reset(
+        new InferenceRunner("eyetracking/models/eyeseg-gpu.engine"));
+      m_processingState[eyeIdx].m_roiExec.reset(
+        new InferenceRunner("eyetracking/models/roi-gpu.engine"));
     }
-  }
-
-  // Load ROI engine
-  {
-    mmfile fp("eyetracking/models/roi-dla-standalone.engine");
+ 
+    // Get the input size
+    {
+      // Segmentation
+      const cudlaModuleTensorDescriptor& desc = m_processingState[0].m_segmentationExec->inputTensorDescriptor(0);
+      m_segInputWidth = desc.w;
+      m_segInputHeight = desc.h;
+      m_segInputRowStrideElements = desc.stride[1] / desc.stride[0];
+      printf("Segmentation image dimensions: %ux%u. Row stride is %u elements\n", m_segInputWidth, m_segInputHeight, m_segInputRowStrideElements);
+    }
+    {
+      // ROI
+      const cudlaModuleTensorDescriptor& desc = m_processingState[0].m_roiExec->inputTensorDescriptor(0);
+      m_roiInputWidth = desc.w;
+      m_roiInputHeight = desc.h;
+      m_roiInputRowStrideElements = desc.stride[1] / desc.stride[0];
+      printf("ROI image dimensions: %ux%u. Row stride is %u elements\n", m_roiInputWidth, m_roiInputHeight, m_roiInputRowStrideElements);
+    }
+ 
+    // Get the output size
+    {
+      // Segmentation
+      const cudlaModuleTensorDescriptor& desc = m_processingState[0].m_segmentationExec->outputTensorDescriptor(0);
+      assert(desc.dataType == CUDLA_DATA_TYPE_HALF);
+      assert(m_segInputWidth == desc.w);
+      assert(m_segInputHeight == desc.h);
+      assert(1 == desc.c);
+      assert(1 == desc.n);
+      m_segOutputRowPitchElements = desc.stride[1] / desc.stride[0];
+      m_segOutputPlanePitchElements = desc.stride[2] / desc.stride[0];
+      printf("Segmentation output row pitch is %u elements, plane pitch is %u elements\n", m_segOutputRowPitchElements, m_segOutputPlanePitchElements);
+    }
+    {
+      // ROI
+      const cudlaModuleTensorDescriptor& desc = m_processingState[0].m_roiExec->outputTensorDescriptor(0);
+      assert(m_processingState[0].m_roiExec->inputTensorDescriptor(0).dataType == desc.dataType);
+      if (desc.dataType == CUDLA_DATA_TYPE_INT8) {
+        m_roiIOIsInt8 = true;
+      } else if (desc.dataType == CUDLA_DATA_TYPE_HALF) {
+        m_roiIOIsInt8 = false;
+      } else {
+        assert(false && "ROI engine: unsupported I/O type (must be kHALF or kINT8)");
+      }
+      m_roiOutputWidth = desc.w;
+      m_roiOutputHeight = desc.h;
+      assert(1 == desc.c);
+      assert(1 == desc.n);
+      m_roiOutputRowStrideElements = desc.stride[1] / desc.stride[0];
+      printf("ROI Output is %ux%u. Row pitch is %u elements\n", m_roiOutputWidth, m_roiOutputHeight, m_roiOutputRowStrideElements);
+    }
+ 
     PER_EYE {
-      m_processingState[eyeIdx].m_roiExec.reset(new CuDLAStandaloneRunner(0, reinterpret_cast<const uint8_t*>(fp.data()), fp.size()));
+      // Pre-create the pupil mask mat
+      ProcessingState& ps = m_processingState[eyeIdx];
+      ps.m_pupilMask.create(m_segInputHeight, m_segInputWidth, CV_8UC1);
+    }
+ 
+    applyCalibrationData();
+ 
+  } catch (const std::exception& ex) {
+    fprintf(stderr, "[EyeTrackingService] DLA init failed: %s\n", ex.what());
+    fprintf(stderr, "[EyeTrackingService] Eye tracking disabled. hmdcam will run without gaze tracking.\n");
+    fprintf(stderr, "[EyeTrackingService] ESP32 displays will show default center gaze.\n");
+    m_disabled = true;
+ 
+    // Release any partially-constructed DLA resources so the destructor is safe
+    PER_EYE {
+      m_processingState[eyeIdx].m_segmentationExec.reset();
+      m_processingState[eyeIdx].m_roiExec.reset();
     }
   }
-
-  // Get the input size
-  {
-    // Segmentation
-    const cudlaModuleTensorDescriptor& desc = m_processingState[0].m_segmentationExec->inputTensorDescriptor(0);
-    m_segInputWidth = desc.w;
-    m_segInputHeight = desc.h;
-
-    m_segInputRowStrideElements = desc.stride[1] / desc.stride[0];
-    printf("Segmentation image dimensions: %ux%u. Row stride is %u elements\n", m_segInputWidth, m_segInputHeight, m_segInputRowStrideElements);
-  }
-
-  {
-    // ROI
-    const cudlaModuleTensorDescriptor& desc = m_processingState[0].m_roiExec->inputTensorDescriptor(0);
-    m_roiInputWidth = desc.w;
-    m_roiInputHeight = desc.h;
-
-    m_roiInputRowStrideElements = desc.stride[1] / desc.stride[0];
-
-    printf("ROI image dimensions: %ux%u. Row stride is %u elements\n", m_roiInputWidth, m_roiInputHeight, m_roiInputRowStrideElements);
-  }
-
-  // Get the output size
-  {
-    // Segmentation
-    const cudlaModuleTensorDescriptor& desc = m_processingState[0].m_segmentationExec->outputTensorDescriptor(0);
-
-    assert(desc.dataType == CUDLA_DATA_TYPE_HALF);
-
-    // Ensure output width and height match
-    assert(m_segInputWidth == desc.w);
-    assert(m_segInputHeight == desc.h);
-
-    // Output should have 1 channel and batch size=1
-    assert(1 == desc.c);
-    assert(1 == desc.n);
-
-    m_segOutputRowPitchElements = desc.stride[1] / desc.stride[0];
-    m_segOutputPlanePitchElements = desc.stride[2] / desc.stride[0];
-
-    printf("Segmentation output row pitch is %u elements, plane pitch is %u elements\n", m_segOutputRowPitchElements, m_segOutputPlanePitchElements);
-  }
-
-  {
-    // ROI
-    const cudlaModuleTensorDescriptor& desc = m_processingState[0].m_roiExec->outputTensorDescriptor(0);
-
-    // Only support same input and output types
-    assert(m_processingState[0].m_roiExec->inputTensorDescriptor(0).dataType == desc.dataType);
-
-    if (desc.dataType == CUDLA_DATA_TYPE_INT8) {
-      m_roiIOIsInt8 = true;
-    } else if (desc.dataType == CUDLA_DATA_TYPE_HALF) {
-      m_roiIOIsInt8 = false;
-    } else {
-      assert(false && "ROI engine: unsupported I/O type (must be kHALF or kINT8)");
-    }
-
-    // Output W/H depends on network config
-    m_roiOutputWidth = desc.w;
-    m_roiOutputHeight = desc.h;
-    // Output should have 1 channel and batch size=1
-    assert(1 == desc.c);
-    assert(1 == desc.n);
-
-    m_roiOutputRowStrideElements = desc.stride[1] / desc.stride[0];
-
-    printf("ROI Output is %ux%u. Row pitch is %u elements\n", m_roiOutputWidth, m_roiOutputHeight, m_roiOutputRowStrideElements);
-  }
-
-  PER_EYE {
-    // Pre-create the pupil mask mat
-    ProcessingState& ps = m_processingState[eyeIdx];
-    ps.m_pupilMask.create(m_segInputHeight, m_segInputWidth, CV_8UC1);
-  }
-
-  applyCalibrationData();
 }
 
 EyeTrackingService::~EyeTrackingService() {
@@ -639,10 +626,14 @@ bool EyeTrackingService::ProcessingState::postprocessOneEye_fitEllipse() {
       double ts = static_cast<double>(currentTimeNs() / 1000ULL) / 1'000'000.0;
       m_pupilFilteredPitchDeg = m_pitchFilter(m_pupilRawPitchDeg, ts);
       m_pupilFilteredYawDeg = m_yawFilter(m_pupilRawYawDeg, ts);
+
+      
     }
   } else {
-    m_eyeFitterOutputsValid = false;
-  }
+      m_eyeFitterOutputsValid = false;
+      // Openness lerps toward closed when no valid fit
+      m_eyeOpenness += (0.0f - m_eyeOpenness) * 0.05f;
+    }
 
   // Had a valid ellipse observation this frame
   return true;
@@ -1089,6 +1080,7 @@ bool EyeTrackingService::processFrame() {
   // Processing thread maintenance:
   // Start threads if they're not running, clean up after exited threads
 
+  if (m_disabled) return false;
   PER_EYE {
 
     // Copy some flags from the service to the tracking thread base
@@ -1237,6 +1229,7 @@ void EyeTrackingService::renderIMGUI() {
 }
 
 glm::vec2 EyeTrackingService::getPitchYawAnglesForEye(size_t eyeIdx) {
+  if (m_disabled) return glm::vec2(0.0f, 0.0f);
   assert(eyeIdx == 0 || eyeIdx == 1);
   ProcessingState& ps = m_processingState[eyeIdx];
 

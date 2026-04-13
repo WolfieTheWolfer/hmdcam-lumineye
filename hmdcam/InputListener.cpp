@@ -6,6 +6,7 @@
 #include <errno.h>
 #include <assert.h>
 #include <pthread.h>
+#include <sys/stat.h>
 
 #include <linux/input.h>
 #include <sys/epoll.h>
@@ -114,6 +115,47 @@ cleanup:
   udev_device_unref(dev);
 }
 
+// Named pipe input for SSH control
+// Usage: echo "menu" > /tmp/hmdcam_input
+static void* namedPipeThread(void*) {
+    pthread_setname_np(pthread_self(), "PipeInput");
+
+    const char* pipePath = "/tmp/hmdcam_input";
+    unlink(pipePath);
+    if (mkfifo(pipePath, 0666) < 0) {
+        printf("PipeInput: failed to create fifo: %s\n", strerror(errno));
+        return NULL;
+    }
+    printf("PipeInput: listening on %s\n", pipePath);
+    printf("PipeInput: commands: up down left right ok back menu\n");
+
+    while (true) {
+        // Open blocks until a writer connects
+        int fd = open(pipePath, O_RDONLY);
+        if (fd < 0) continue;
+
+        char buf[64];
+        ssize_t n = read(fd, buf, sizeof(buf) - 1);
+        close(fd);
+
+        if (n <= 0) continue;
+        buf[n] = '\0';
+
+        // Strip trailing newline
+        for (int i = n - 1; i >= 0 && (buf[i] == '\n' || buf[i] == '\r'); --i)
+            buf[i] = '\0';
+
+        if      (!strcmp(buf, "up"))    buttonState[kButtonUp].store(true);
+        else if (!strcmp(buf, "down"))  buttonState[kButtonDown].store(true);
+        else if (!strcmp(buf, "left"))  buttonState[kButtonLeft].store(true);
+        else if (!strcmp(buf, "right")) buttonState[kButtonRight].store(true);
+        else if (!strcmp(buf, "ok"))    buttonState[kButtonOK].store(true);
+        else if (!strcmp(buf, "back"))  buttonState[kButtonBack].store(true);
+        else if (!strcmp(buf, "menu"))  buttonState[kButtonPower].store(true);
+        else printf("PipeInput: unknown command '%s'\n", buf);
+    }
+    return NULL;
+}
 
 void* inputListenerThread(void*) {
   pthread_setname_np(pthread_self(), "InputListener");
@@ -272,7 +314,7 @@ void* inputListenerThread(void*) {
             break;
 
           case KEY_COMPOSE:
-            buttonState[kButtonMenu].store(true);
+            buttonState[kButtonPower].store(true);
             break;
 
           case KEY_ESC:
@@ -309,6 +351,7 @@ void* inputListenerThread(void*) {
 void startInputListenerThread() {
   pthread_t thread;
   pthread_create(&thread, NULL, inputListenerThread, NULL);
+  pthread_create(&thread, NULL, namedPipeThread, NULL);
 }
 
 // Ignore non-use of the enum-to-string functions below here

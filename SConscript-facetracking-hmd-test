@@ -38,11 +38,12 @@ ftEnv.Append(
     'boost_chrono', 'boost_system', 'boost_thread',
     'epoxy',
     'drm',
+    'gbm',
     'wayland-client', 'wayland-egl', 'xkbcommon',
     'hidapi-libusb', 'usb-1.0', 'udev',
     'cuda', 'cudart', 'cudla',
     'opencv_core', 'opencv_imgproc', 'opencv_imgcodecs', 'opencv_calib3d', 'opencv_aruco', 'opencv_objdetect',
-    'nvscibuf', 'nvscicommon', 'nvscievent', 'nvsciipc', 'nvscisync', 'nvmedia_ijpd_sci',
+    'nvscibuf', 'nvscicommon', 'nvscievent', 'nvsciipc', 'nvscisync', 'nvmedia_ijpd_sci', 'nvinfer',
     'nvToolsExt',
   ] + ftEnv['CERES_LIBS']
 )

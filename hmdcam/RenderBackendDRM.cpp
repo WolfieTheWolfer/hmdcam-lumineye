@@ -12,6 +12,7 @@
 #include <fcntl.h>
 #include <math.h>
 #include <unistd.h>
+#include <gbm.h>
 
 #define DRM_CHECK(x) if ((x) != 0) { fprintf(stderr, "%s:%d: %s failed (%s)\n", __FILE__, __LINE__, #x, strerror(errno)); abort(); }
 #define DRM_CHECK_PTR(x) if ((x) == nullptr) { fprintf(stderr, "%s:%d: %s failed (%s)\n", __FILE__, __LINE__, #x, strerror(errno)); abort(); }
@@ -60,50 +61,32 @@ void RenderBackendDRM::init() {
 
   memset(&m_drmFb, 0, sizeof(m_drmFb));
 
-  EGLint deviceCount = 0;
-  EGL_CHECK_BOOL(eglQueryDevicesEXT(0, NULL, &deviceCount));
-  if (!deviceCount) {
-    fprintf(stderr, "No EGL devices returned\n");
+  // Open card0 directly - nvidia-drm is always on card0 after boot fix
+  m_drmFd = open("/dev/dri/card0", O_RDWR);
+  if (m_drmFd <= 0) {
+    fprintf(stderr, "Unable to open /dev/dri/card0\n");
     abort();
   }
+  fprintf(stderr, "Opened /dev/dri/card0\n");
 
-  {
-    EGLDeviceEXT* eglDevices = new EGLDeviceEXT[deviceCount];
-    EGL_CHECK_BOOL(eglQueryDevicesEXT(deviceCount, eglDevices, &deviceCount));
+  // Create GBM device
+  m_gbmDevice = gbm_create_device(m_drmFd);
 
-    for (int i = 0; i < deviceCount; ++i) {
-      const char* drmName = eglQueryDeviceStringEXT(eglDevices[i], EGL_DRM_DEVICE_FILE_EXT);
-      fprintf(stderr, "EGL device [%d]: DRM file %s\n", i, drmName);
-      if (!drmName)
-        continue;
+  // Set atomic modeset caps - required by nvidia Tegra EGL
+  drmSetClientCap(m_drmFd, DRM_CLIENT_CAP_ATOMIC, 1);
+  drmSetClientCap(m_drmFd, DRM_CLIENT_CAP_UNIVERSAL_PLANES, 1);
 
-      if (!strcmp(drmName, "drm-nvdc")) {
-        m_drmFd = drmOpen(drmName, NULL);
-      } else {
-        m_drmFd = open(drmName, O_RDWR, 0);
-      }
-      if (m_drmFd <= 0) {
-        fprintf(stderr, "Unable to open DRM devices %s\n", drmName);
-        continue;
-      }
-
-      m_eglDevice = eglDevices[i];
-      fprintf(stderr, " -- Opened DRM device for EGL device %d\n", i);
-      break;
-    }
-
-    delete[] eglDevices;
-
-    if (!m_eglDevice) {
-      fprintf(stderr, "Unable to open any DRM device.\n");
-      abort();
-    }
+  if (!m_gbmDevice) {
+    fprintf(stderr, "Failed to create GBM device\n");
+    abort();
   }
+  fprintf(stderr, "Created GBM device\n");
+
 
   //DRM_CHECK(drmSetClientCap(m_drmFd, DRM_CLIENT_CAP_ATOMIC, 1));
   //DRM_CHECK(drmSetClientCap(m_drmFd, DRM_CLIENT_CAP_UNIVERSAL_PLANES, 1));
 
-  DRM_CHECK_PTR(m_drmResources = drmModeGetResources(m_drmFd));
+  fprintf(stderr, "Waiting 5s for HMD display to power up...\n"); sleep(5); DRM_CHECK_PTR(m_drmResources = drmModeGetResources(m_drmFd));
 
   drmModePlaneRes* planeRes = nullptr;
   DRM_CHECK_PTR(planeRes = drmModeGetPlaneResources(m_drmFd));
@@ -248,29 +231,36 @@ void RenderBackendDRM::init() {
 
   // Add the framebuffer and do the modeset
   uint32_t offset = 0;
-  DRM_CHECK(drmModeAddFB2(m_drmFd, surfaceWidth(), surfaceHeight(), DRM_FORMAT_ARGB8888, &m_drmFb.handle, &m_drmFb.pitch, &offset, &m_drmFbBufferId, 0));
+  DRM_CHECK(drmModeAddFB2(m_drmFd, surfaceWidth(), surfaceHeight(), DRM_FORMAT_XRGB8888, &m_drmFb.handle, &m_drmFb.pitch, &offset, &m_drmFbBufferId, 0));
   DRM_CHECK(drmModeSetCrtc(m_drmFd, /*crtcId=*/ m_drmCrtc->crtc_id, /*bufferId=*/ m_drmFbBufferId, /*x=*/ 0, /*y=*/ 0, /*connectors=*/ &m_drmConnector->connector_id, /*count=*/ 1, m_drmModeInfo));
 
-  // Set up the EGL display
+  // Set up EGL display using device platform (nvidia device identified by EGL_NV_device_cuda)
   {
-    EGLint attrs[] = {
-      EGL_DRM_MASTER_FD_EXT, m_drmFd,
-      EGL_NONE
-    };
-    DRM_CHECK_PTR(m_eglDisplay = eglGetPlatformDisplayEXT(EGL_PLATFORM_DEVICE_EXT, m_eglDevice, attrs));
-
-    EGLint major, minor;
-    EGL_CHECK_BOOL(eglInitialize(m_eglDisplay, &major, &minor));
+    PFNEGLQUERYDEVICESEXTPROC queryDevices = (PFNEGLQUERYDEVICESEXTPROC)eglGetProcAddress("eglQueryDevicesEXT");
+    PFNEGLQUERYDEVICESTRINGEXTPROC queryDeviceString = (PFNEGLQUERYDEVICESTRINGEXTPROC)eglGetProcAddress("eglQueryDeviceStringEXT");
+    EGLDeviceEXT devices[8];
+    EGLint deviceCount = 0;
+    queryDevices(8, devices, &deviceCount);
+    for (int i = 0; i < deviceCount; i++) {
+      const char* devExts = queryDeviceString(devices[i], EGL_EXTENSIONS);
+      const char* drm = queryDeviceString(devices[i], EGL_DRM_DEVICE_FILE_EXT);
+      fprintf(stderr, "EGL device %d: drm=%s cuda=%s\n", i, drm ? drm : "null",
+              (devExts && strstr(devExts, "EGL_NV_device_cuda")) ? "yes" : "no");
+      if (!devExts || !strstr(devExts, "EGL_NV_device_cuda")) continue;
+      EGLint attrs[] = { EGL_DRM_MASTER_FD_EXT, m_drmFd, EGL_NONE };
+      EGLDisplay testDpy = eglGetPlatformDisplayEXT(EGL_PLATFORM_DEVICE_EXT, devices[i], attrs);
+      EGLint major, minor;
+      if (eglInitialize(testDpy, &major, &minor)) {
+        fprintf(stderr, "EGL device %d initialized OK: %d.%d\n", i, major, minor);
+        m_eglDisplay = testDpy;
+        break;
+      }
+      fprintf(stderr, "EGL device %d: eglInitialize failed (%d)\n", i, eglGetError());
+      eglTerminate(testDpy);
+    }
   }
 
-  // printf("Display Extensions: %s\n\n", eglQueryString(m_eglDisplay, EGL_EXTENSIONS));
-  // printf("Device Extensions: %s\n\n", eglQueryDeviceStringEXT(m_eglDevice, EGL_EXTENSIONS));
-
-  CheckExtension("EGL_EXT_output_base");
-  CheckExtension("EGL_EXT_output_drm");
-  CheckExtension("EGL_EXT_stream_consumer_egloutput");
-
-  // Choose a config and create a context
+  // Choose EGL config
   EGLint cfg_attr[] = {
     EGL_SURFACE_TYPE, EGL_STREAM_BIT_KHR,
     EGL_RENDERABLE_TYPE, EGL_OPENGL_ES3_BIT,
@@ -283,35 +273,49 @@ void RenderBackendDRM::init() {
 
   int n;
   EGL_CHECK_BOOL(eglChooseConfig(m_eglDisplay, cfg_attr, &m_eglConfig, 1, &n));
+
+  // Create context
   EGLint ctx_attr[] = {EGL_CONTEXT_CLIENT_VERSION, 3, EGL_NONE};
   eglBindAPI(EGL_OPENGL_ES_API);
   DRM_CHECK_PTR(m_eglContext = eglCreateContext(m_eglDisplay, m_eglConfig, EGL_NO_CONTEXT, ctx_attr));
-
-  // Activate the display and context to make sure that libepoxy reads the right extension strings.
-  // (It uses the display returned by eglGetCurrentDisplay() to detect extensions on first use)
-  // If we don't do this, then loading EGL_KHR_stream and EGL_EXT_output_base will fail.
+  // Make context current with no surface so epoxy can load extension function pointers
   EGL_CHECK_BOOL(eglMakeCurrent(m_eglDisplay, EGL_NO_SURFACE, EGL_NO_SURFACE, m_eglContext));
 
-  // Get the layer for this crtc/plane
+  printf("Display Extensions: %s\n\n", eglQueryString(m_eglDisplay, EGL_EXTENSIONS));
+  // printf("Device Extensions: %s\n\n", eglQueryDeviceStringEXT(m_eglDevice, EGL_EXTENSIONS));
+
+// Enumerate all output layers for debugging
+  EGLint layerCount = 0;
+  eglGetOutputLayersEXT(m_eglDisplay, NULL, NULL, 0, &layerCount);
+  fprintf(stderr, "Available EGL output layers: %d\n", layerCount);
+  EGLOutputLayerEXT* layers = new EGLOutputLayerEXT[layerCount];
+  eglGetOutputLayersEXT(m_eglDisplay, NULL, layers, layerCount, &layerCount);
+  for (int i = 0; i < layerCount; i++) {
+    EGLAttrib crtcId = 0, planeId = 0;
+    eglQueryOutputLayerAttribEXT(m_eglDisplay, layers[i], EGL_DRM_CRTC_EXT, &crtcId);
+    eglQueryOutputLayerAttribEXT(m_eglDisplay, layers[i], EGL_DRM_PLANE_EXT, &planeId);
+    fprintf(stderr, "  Layer %d: CRTC=%ld PLANE=%ld\n", i, crtcId, planeId);
+  }
+  // Get the output layer for this CRTC
   EGLAttrib layer_attr[] = {
     EGL_DRM_CRTC_EXT, m_drmCrtc->crtc_id,
     EGL_NONE
   };
-
   EGL_CHECK_BOOL(eglGetOutputLayersEXT(m_eglDisplay, layer_attr, &m_eglOutputLayer, 1, &n));
+  delete[] layers;
 
-  // Create output stream
-  EGLint stream_attr[] = {
-    EGL_STREAM_FIFO_LENGTH_KHR, 1,
-    EGL_NONE};
+  // Create EGL stream
+  EGLint stream_attr[] = { EGL_NONE };
+
   DRM_CHECK_PTR(m_eglStream = eglCreateStreamKHR(m_eglDisplay, stream_attr));
   EGL_CHECK_BOOL(eglStreamConsumerOutputEXT(m_eglDisplay, m_eglStream, m_eglOutputLayer));
 
-  // Create surface to feed the stream
+  // Create stream producer surface
   EGLint srf_attr[] = {
-    EGL_WIDTH, (EGLint) surfaceWidth(),
-    EGL_HEIGHT, (EGLint) surfaceHeight(),
-    EGL_NONE};
+    EGL_WIDTH, (EGLint)surfaceWidth(),
+    EGL_HEIGHT, (EGLint)surfaceHeight(),
+    EGL_NONE
+  };
 
   DRM_CHECK_PTR(m_eglSurface = eglCreateStreamProducerSurfaceKHR(m_eglDisplay, m_eglConfig, m_eglStream, srf_attr));
   EGL_CHECK_BOOL(eglMakeCurrent(m_eglDisplay, m_eglSurface, m_eglSurface, m_eglContext));
@@ -325,17 +329,13 @@ RenderBackendDRM::~RenderBackendDRM() {
   eglMakeCurrent(m_eglDisplay, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
   eglDestroyContext(m_eglDisplay, m_eglContext);
   eglDestroySurface(m_eglDisplay, m_eglSurface);
-  eglDestroyStreamKHR(m_eglDisplay, m_eglStream);
 
   eglTerminate(m_eglDisplay);
 
   m_eglDisplay = NULL;
   m_eglSurface = NULL;
   m_eglContext = NULL;
-  m_eglStream = NULL;
   // OutputLayer and Device belong to the Display and don't need to be explicitly freed
-  m_eglOutputLayer = NULL;
-  m_eglDevice = NULL;
 
   // Remove and destroy DRM framebuffer
   drmModeRmFB(m_drmFd, m_drmFbBufferId);
@@ -358,6 +358,9 @@ RenderBackendDRM::~RenderBackendDRM() {
   m_drmEncoder = NULL;
   m_drmCrtc = NULL;
   m_drmResources = NULL;
+
+  if (m_gbmSurface) gbm_surface_destroy(m_gbmSurface);
+  if (m_gbmDevice) gbm_device_destroy(m_gbmDevice);
 
   close(m_drmFd);
   m_drmFd = -1;

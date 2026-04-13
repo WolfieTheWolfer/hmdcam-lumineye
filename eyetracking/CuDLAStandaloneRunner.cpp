@@ -33,6 +33,7 @@
 #include "common/mmfile.h"
 #include "common/tegra/NvSciUtil.h"
 #include <unistd.h>
+#include <stdexcept>
 
 #define CleanupPtr(Fn, Obj, ... ) if (Obj != nullptr) { Fn(Obj  ,## __VA_ARGS__); Obj = nullptr; }
 
@@ -42,7 +43,7 @@ bool checkCUDLAstatus(cudlaStatus st, const char* op, const char* file, int line
   if (st != cudlaSuccess) {
     fprintf(stderr, "%s (%s:%d) returned cudlaStatus %d\n", op, file, line, st);
     if (fatal)
-      abort();
+      throw std::runtime_error("CuDLA fatal error");
     return false;
   }
   return true;
@@ -51,12 +52,9 @@ bool checkCUDLAstatus(cudlaStatus st, const char* op, const char* file, int line
 static void printTensorDesc(const std::vector<cudlaModuleTensorDescriptor>& tensorDescs) {
   for (size_t idx = 0; idx < tensorDescs.size(); ++idx) {
     const cudlaModuleTensorDescriptor& desc = tensorDescs[idx];
-
     printf("\tTENSOR %zu NAME : %s\n", idx, desc.name);
     printf("\tsize: %lu\n", desc.size);
-
     printf("\tdims [n,c,h,w]: [%lu, %lu, %lu, %lu]\n", desc.n, desc.c, desc.h, desc.w);
-
     printf("\tdata fmt: %d\n", desc.dataFormat);
     printf("\tdata type: %d\n", desc.dataType);
     printf("\tdata category: %d\n", desc.dataCategory);
@@ -150,7 +148,6 @@ void CuDLAStandaloneRunner::initWithModuleData(uint64_t deviceIdx, const uint8_t
     cudlaModuleAttribute attribute;
 
     CUDLA_CHECK(cudlaModuleGetAttributes(m_moduleHandle, CUDLA_NUM_INPUT_TENSORS, &attribute));
-
     uint32_t numInputTensors = attribute.numInputTensors;
     printf("numInputTensors = %d\n", numInputTensors);
 
@@ -163,13 +160,11 @@ void CuDLAStandaloneRunner::initWithModuleData(uint64_t deviceIdx, const uint8_t
 
     attribute.inputTensorDesc = m_inputTensorDesc.data();
     CUDLA_CHECK(cudlaModuleGetAttributes(m_moduleHandle, CUDLA_INPUT_TENSOR_DESCRIPTORS, &attribute));
-
     printf("Input tensor descriptor:\n");
     printTensorDesc(m_inputTensorDesc);
 
     attribute.outputTensorDesc = m_outputTensorDesc.data();
     CUDLA_CHECK(cudlaModuleGetAttributes(m_moduleHandle, CUDLA_OUTPUT_TENSOR_DESCRIPTORS, &attribute));
-
     printf("Output tensor descriptor:\n");
     printTensorDesc(m_outputTensorDesc);
   }
@@ -210,21 +205,15 @@ void CuDLAStandaloneRunner::initWithModuleData(uint64_t deviceIdx, const uint8_t
     NVSCI_CHECK(NvSciSyncAttrListCreate(m_syncModule, &signalerAttrList));
     CUDLA_CHECK(cudlaGetNvSciSyncAttributes(reinterpret_cast<uint64_t *>(signalerAttrList), CUDLA_NVSCISYNC_ATTR_SIGNAL));
 
-    // Require deterministic fence
     bool rdfValue = true;
     NvSciSyncAttrKeyValuePair kvp = { NvSciSyncAttrKey_RequireDeterministicFences, &rdfValue, sizeof(rdfValue) };
     NVSCI_CHECK(NvSciSyncAttrListSetAttrs(signalerAttrList, &kvp, 1));
 
     NvSciSyncAttrList cudlaSignalerSyncAttrList = ReconcileNvSciSyncAttrLists(signalerAttrList, CreateNvSciSyncCpuWaiterAttrList(m_syncModule));
-
     NVSCI_CHECK(NvSciSyncObjAlloc(cudlaSignalerSyncAttrList, &m_syncSignalObj));
-
     NvSciSyncAttrListFree(cudlaSignalerSyncAttrList);
 
-    // Bind fence with syncobj with expected fence value after task completion
-    NVSCI_CHECK(NvSciSyncFenceUpdateFence(m_syncSignalObj, m_signalerID, m_signalerValue, &m_eofFence));
-    NVSCI_CHECK(NvSciSyncFenceExtractFence(&m_eofFence, &m_signalerID, &m_signalerValue));
-    NVSCI_CHECK(NvSciSyncFenceUpdateFence(m_syncSignalObj, m_signalerID, ++m_signalerValue, &m_eofFence));
+    NVSCI_CHECK(NvSciSyncObjGenerateFence(m_syncSignalObj, &m_eofFence));
   }
 
   {
@@ -232,27 +221,21 @@ void CuDLAStandaloneRunner::initWithModuleData(uint64_t deviceIdx, const uint8_t
     NVSCI_CHECK(NvSciSyncAttrListCreate(m_syncModule, &waiterAttrList));
     CUDLA_CHECK(cudlaGetNvSciSyncAttributes(reinterpret_cast<uint64_t *>(waiterAttrList), CUDLA_NVSCISYNC_ATTR_WAIT));
 
-    // Require deterministic fence
     bool rdfValue = true;
     NvSciSyncAttrKeyValuePair kvp = { NvSciSyncAttrKey_RequireDeterministicFences, &rdfValue, sizeof(rdfValue) };
     NVSCI_CHECK(NvSciSyncAttrListSetAttrs(waiterAttrList, &kvp, 1));
 
     NvSciSyncAttrList cudlaWaiterSyncAttrList = ReconcileNvSciSyncAttrLists(waiterAttrList, CreateNvSciSyncCpuSignalerAttrList(m_syncModule));
-
     NVSCI_CHECK(NvSciSyncObjAlloc(cudlaWaiterSyncAttrList, &m_syncWaitObj));
     NVSCI_CHECK(NvSciSyncCpuWaitContextAlloc(m_syncModule, &m_cpuWaitCtx));
-
     NvSciSyncAttrListFree(cudlaWaiterSyncAttrList);
 
-    // Bind fence with syncobj with expected fence value after task completion
-    NVSCI_CHECK(NvSciSyncFenceUpdateFence(m_syncWaitObj, m_waiterID, m_waiterValue, &m_preFence));
-    NVSCI_CHECK(NvSciSyncFenceExtractFence(&m_preFence, &m_waiterID, &m_waiterValue));
-    NVSCI_CHECK(NvSciSyncFenceUpdateFence(m_syncWaitObj, m_waiterID, ++m_waiterValue, &m_preFence));
+    NVSCI_CHECK(NvSciSyncObjGenerateFence(m_syncWaitObj, &m_preFence));
   }
 
   // Import NvSci Sync objects as external semaphores
   {
-    cudlaExternalSemaphoreHandleDesc semaMemDesc         = {0};
+    cudlaExternalSemaphoreHandleDesc semaMemDesc = {0};
     memset(&semaMemDesc, 0, sizeof(semaMemDesc));
     semaMemDesc.extSyncObject = m_syncWaitObj;
     CUDLA_CHECK(cudlaImportExternalSemaphore(m_devHandle, &semaMemDesc, &m_syncWaitObjRegPtr, 0));
@@ -266,31 +249,25 @@ void CuDLAStandaloneRunner::initWithModuleData(uint64_t deviceIdx, const uint8_t
   {
     memset(&m_waitEvents, 0, sizeof(m_waitEvents));
     m_waitEvents.numEvents = 1;
-
     memset(m_preFences, 0, sizeof(m_preFences));
-
-    m_preFences[0].fence      = &m_preFence;
-    m_preFences[0].type       = CUDLA_NVSCISYNC_FENCE;
-
+    m_preFences[0].fence = &m_preFence;
+    m_preFences[0].type  = CUDLA_NVSCISYNC_FENCE;
     m_waitEvents.preFences = m_preFences;
   }
 
   // Signal Events
   {
     memset(m_signalEventDevPtrs, 0, sizeof(m_signalEventDevPtrs));
-
-    m_signalEventDevPtrs[0]            = m_syncSignalObjRegPtr;
-
+    m_signalEventDevPtrs[0] = m_syncSignalObjRegPtr;
     memset(&m_signalEvents, 0, sizeof(m_signalEvents));
     m_signalEvents.numEvents = 1;
     m_signalEvents.devPtrs = m_signalEventDevPtrs;
     m_signalEvents.eofFences = m_eofFences;
-
     m_eofFences[0].fence = &m_eofFence;
     m_eofFences[0].type  = CUDLA_NVSCISYNC_FENCE;
   }
 
-  // Setup task struct, since it'll always be the same
+  // Setup task struct
   m_task.moduleHandle     = m_moduleHandle;
   m_task.outputTensor     = &m_outputBufObjRegPtr;
   m_task.numOutputTensors = 1;
@@ -302,32 +279,19 @@ void CuDLAStandaloneRunner::initWithModuleData(uint64_t deviceIdx, const uint8_t
 
 
 void CuDLAStandaloneRunner::asyncStartInference() {
-  // Flush input buffer
   NVSCI_CHECK(NvSciBufObjFlushCpuCacheRange(m_inputBufObj, 0, m_inputTensorDesc[0].size));
-
-  // Signal wait events
   NvSciSyncObjSignal(m_syncWaitObj);
-
-  // Enqueue a cuDLA task.
   CUDLA_CHECK(cudlaSubmitTask(m_devHandle, &m_task, 1, NULL, 0));
 }
 
 
 void CuDLAStandaloneRunner::asyncFinishInference() {
-  // Wait for operations to finish and bring output buffer to CPU.
   NVSCI_CHECK(NvSciSyncFenceWait(reinterpret_cast<NvSciSyncFence *>(m_signalEvents.eofFences[0].fence), m_cpuWaitCtx, -1));
-
-  // Flush output buffer
   NVSCI_CHECK(NvSciBufObjFlushCpuCacheRange(m_outputBufObj, 0, m_outputTensorDesc[0].size));
 
   // Update prefence for next submission
-  NVSCI_CHECK(NvSciSyncFenceExtractFence(&m_preFence, &m_waiterID, &m_waiterValue));
-  NVSCI_CHECK(NvSciSyncFenceUpdateFence(m_syncWaitObj, m_waiterID, ++m_waiterValue, &m_preFence));
+  NVSCI_CHECK(NvSciSyncObjGenerateFence(m_syncWaitObj, &m_preFence));
 
   // Update eoffence for next submission
-  NVSCI_CHECK(NvSciSyncFenceExtractFence(&m_eofFence, &m_signalerID, &m_signalerValue));
-  NVSCI_CHECK(NvSciSyncFenceUpdateFence(m_syncSignalObj, m_signalerID, ++m_signalerValue, &m_eofFence));
-
-  // Output is available in outputBufObjBuffer.
+  NVSCI_CHECK(NvSciSyncObjGenerateFence(m_syncSignalObj, &m_eofFence));
 }
-

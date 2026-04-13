@@ -9,6 +9,10 @@
 #include <glm/glm.hpp>
 #include <opencv2/core.hpp>
 #include "CuDLAStandaloneRunner.h"
+#include "TRTGPURunner.h"
+#ifndef InferenceRunner
+using InferenceRunner = TRTGPURunner;
+#endif
 #include "V4L2Camera.h"
 
 #include <algorithm>
@@ -80,7 +84,7 @@ public:
 
 
     // DLA model
-    std::unique_ptr<CuDLAStandaloneRunner> m_trackingModel;
+    std::unique_ptr<InferenceRunner> m_trackingModel;
     cv::Rect m_captureCropRect;
     cv::Mat m_inputScaleMat;
 

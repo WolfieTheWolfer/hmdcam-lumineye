@@ -2,6 +2,7 @@
 #include "RenderBackend.h"
 #include <epoxy/egl.h>
 #include <xf86drmMode.h>
+#include <gbm.h>
 #include "rhi/egl/RHIEGLSurfaceRenderTargetGL.h"
 
 class RenderBackendDRM : public RenderBackend {
@@ -30,7 +31,10 @@ private:
 
   // Internal state
   int m_drmFd = -1;
-  EGLDeviceEXT m_eglDevice = NULL;
+  struct gbm_device* m_gbmDevice = nullptr;
+  struct gbm_surface* m_gbmSurface = nullptr;
+  struct gbm_bo* m_gbmBo = nullptr;
+  struct gbm_bo* m_gbmPreviousBo = nullptr;
   EGLDisplay m_eglDisplay = EGL_NO_DISPLAY;
   EGLContext m_eglContext = NULL;
 

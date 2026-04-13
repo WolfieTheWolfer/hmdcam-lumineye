@@ -5,6 +5,7 @@
 #include "rhi/RHIRect.h"
 #include "rhi/RHIRenderPipeline.h"
 #include "rhi/RHIRenderTarget.h"
+#include "GazeSender.h"
 
 class RenderBackend;
 
@@ -66,4 +67,7 @@ extern RHIRenderPipeline::ptr camUndistortOverlayPipeline;
 extern RHIRenderPipeline::ptr solidQuadPipeline;
 
 extern RHISurface::ptr disabledMaskTex;
+
+void RenderUpdateGaze(GazeVec3 leftGaze,  float leftPupilDiameterMm,
+                      GazeVec3 rightGaze, float rightPupilDiameterMm);
 
